@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
+from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 
 
 def estimate_swa_kv_tokens(
@@ -533,7 +534,32 @@ class ChainPrefillBudget(SWAPrefillBudget):
             ),
         )
 
+    def _soon_free_tokens(self) -> tuple[int, int]:
+        """Owner and primary-window tokens of ended requests that come back once
+        the forward in flight is processed (the pool's release queue)."""
+        queue = getattr(self.allocator, "release_queue", None)
+        if not isinstance(queue, ReleaseQueue):
+            return 0, 0
+        window = self.allocator.swa_attn_allocator
+        return (
+            queue.held_tokens(self.allocator.full_attn_allocator),
+            0 if window is None else queue.held_tokens(window),
+        )
+
     def check_prefill(self, **kwargs) -> tuple[bool, int | None]:
+        # A request's later tokens find the held pages back: admission counts
+        # them as soon-free. What is allocated now (chunk sizing,
+        # can_allocate_prefill) does not.
+        soon_full, soon_window = self._soon_free_tokens()
+        self.total_offset -= soon_full
+        self.swa_offset -= soon_window
+        try:
+            return self._check_prefill(**kwargs)
+        finally:
+            self.total_offset += soon_full
+            self.swa_offset += soon_window
+
+    def _check_prefill(self, **kwargs) -> tuple[bool, int | None]:
         if self.rules.window == "joint":
             return self._joint_check_prefill(**kwargs)
         state_slots = kwargs.pop("state_slots", 0)

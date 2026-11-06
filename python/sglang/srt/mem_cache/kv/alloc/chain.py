@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     no_relief_plan,
     snapshot_chain,
 )
+from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
@@ -273,6 +274,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 self.mamba_allocator,
             )
             if b is not None
+        )
+        # A lazy chain reuses a freed page from the schedule stream (zeroing,
+        # compaction), so a request's pages wait for the forwards that include
+        # it; an eager free orders itself after the forward stream instead.
+        self.release_queue: Optional[ReleaseQueue] = (
+            ReleaseQueue(self, self.members) if lazy_compaction else None
         )
         by_name = {band.sub_pool_name: band for band in self.members}
         self.bands = tuple(by_name[band.name] for band in arena.bands)
@@ -1387,6 +1394,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._clear_inverse_history()
 
     def clear(self) -> None:
+        if self.release_queue is not None:
+            self.release_queue.clear()
         for member in self.members:
             member.clear()
         if self.state is not None:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 from array import array
+from contextlib import nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
@@ -28,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -303,6 +306,32 @@ def match_kv_cache(
     return match_result
 
 
+def _release_queue(tree_cache: BasePrefixCache) -> Optional[ReleaseQueue]:
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    queue = getattr(allocator, "release_queue", None)
+    return queue if isinstance(queue, ReleaseQueue) else None
+
+
+def release_hold(tree_cache: BasePrefixCache, req: Optional[Req]):
+    """Hold the pool frees made in the block until every forward that includes
+    ``req`` has been processed, when the pool reuses freed pages outside forward
+    order (`ReleaseQueue`); otherwise the frees apply at once."""
+    queue = _release_queue(tree_cache)
+    if queue is None or not queue.in_flight(req):
+        return nullcontext()
+    return queue.holding(req)
+
+
+def unlock_after_held_frees(tree_cache: BasePrefixCache, lock) -> None:
+    """Unlock ``lock`` now, or with the open release hold: a node the running
+    forward reads must not become evictable before the forward is processed."""
+    if lock is None:
+        return
+    queue = _release_queue(tree_cache)
+    if queue is None or not queue.defer(partial(tree_cache.unlock, lock)):
+        tree_cache.unlock(lock)
+
+
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Publish what the running request has computed so far, unless it is
     barred from the tree."""
@@ -310,7 +339,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
-        tree_cache.checkpoint(req, up_to=req.extend_end)
+        # The insert frees this request's own copies of pages the tree already
+        # holds; the running forward may still read them.
+        with release_hold(tree_cache, req):
+            tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 
@@ -445,7 +477,13 @@ def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
-    what it can key."""
+    what it can key. The insert happens now; the pages that leave the request,
+    and its tree lock, go back once no unprocessed forward includes it."""
+    with release_hold(tree_cache, req):
+        _release_kv_cache(req, tree_cache, checkpoint=checkpoint)
+
+
+def _release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -476,7 +514,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-    tree_cache.unlock(req.lock)
+    unlock_after_held_frees(tree_cache, req.lock)
     req.lock = None
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache

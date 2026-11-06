@@ -334,6 +334,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -4754,6 +4755,11 @@ class Scheduler(
         """The bookkeeping of every step once its result is processed."""
         self.invariant_checker.maybe_check_batch_consistency(batch)
         batch.drop_inflight_step()
+        # The forward is done (its result processing synchronized it): give back
+        # the KV of requests no unprocessed forward includes any more.
+        release_queue = self._release_queue()
+        if release_queue is not None:
+            release_queue.release_retired()
         # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
         self.prefill_launched_reqs.leave_finished()
@@ -4770,6 +4776,23 @@ class Scheduler(
             and req.next_output_finishes_by_length()
         ]
 
+    def _release_queue(self) -> Optional[ReleaseQueue]:
+        """The pool's queue of releases held behind forwards in flight, if any."""
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        queue = getattr(allocator, "release_queue", None)
+        return queue if isinstance(queue, ReleaseQueue) else None
+
+    def _kv_release_after_forward(self, batch: ScheduleBatch) -> bool:
+        """Whether KV comes back once the forward in flight is processed: a held
+        release, or a retraction now, which a pool that holds the pages of a
+        request in flight would only hold. Decode waits a step for it instead."""
+        release_queue = self._release_queue()
+        if release_queue is None:
+            return False
+        return len(release_queue) > 0 or any(
+            release_queue.in_flight(req) for req in batch.reqs
+        )
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
@@ -4784,7 +4807,9 @@ class Scheduler(
             # Retained document windows yield to running requests before retraction.
             self.uocr_runtime.free_for_decode(batch)
         kv_full_retract_flag = not batch.check_decode_mem()
-        if kv_full_retract_flag and finishing_reqs:
+        if kv_full_retract_flag and (
+            finishing_reqs or self._kv_release_after_forward(batch)
+        ):
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
             batch.batch_is_full = False

@@ -44,6 +44,9 @@ class SessionSlot:
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
+    # The turn that last ran on the record: a forward that includes it may
+    # still read the record's pages, so frees of them wait for it.
+    last_turn: Optional[Req] = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -152,7 +155,10 @@ class StreamingSession:
             prefix_len = (prefix_len // self.cache.page_size) * self.cache.page_size
             req.kv.truncate_committed(prefix_len)
 
-        self._free_tail(req.kv, prefix_len)
+        from sglang.srt.mem_cache.common import release_hold
+
+        with release_hold(self.cache, slot.last_turn):
+            self._free_tail(req.kv, prefix_len)
 
         return MatchResult(
             device_prefix_len=prefix_len,
@@ -196,6 +202,7 @@ class StreamingSession:
         req.detach_kv()
         req.swa_branching_seqlen = None
         slot.publishes_prompt = False
+        slot.last_turn = req
         # Use the finished length, not the req clock (it lags an in-flight verify
         # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.commit_finished(target)
@@ -252,17 +259,22 @@ class StreamingSession:
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
         )
 
-        self.cache.unlock(slot.lock)
+        from sglang.srt.mem_cache.common import release_hold, unlock_after_held_frees
 
-        if slot.kv.holds_kv:
-            self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
-            kv_storage_of(
-                self.cache.req_to_token_pool,
-                self.cache.token_to_kv_pool_allocator,
-                tree_cache=self.cache,
-            ).release_row(slot)
+        with release_hold(self.cache, slot.last_turn):
+            unlock_after_held_frees(self.cache, slot.lock)
 
-        self._free_slot_mamba(slot)
+            if slot.kv.holds_kv:
+                self.cache.free_kv_row(
+                    slot.kv, [(protected_len, slot.kv.kv_allocated_len)]
+                )
+                kv_storage_of(
+                    self.cache.req_to_token_pool,
+                    self.cache.token_to_kv_pool_allocator,
+                    tree_cache=self.cache,
+                ).release_row(slot)
+
+            self._free_slot_mamba(slot)
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""

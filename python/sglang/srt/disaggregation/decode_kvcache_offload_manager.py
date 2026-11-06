@@ -15,6 +15,7 @@ from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_hold, unlock_after_held_frees
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -339,16 +340,19 @@ class DecodeKVCacheOffloadManager:
         # Released only at request finish; a mid-decode free races with
         # concurrent admission over live slots. The prefix the prealloc match
         # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-        kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-        ).release_row(req)
+        # The device-to-host copy can end before the forward that last included
+        # the request; its pages go back once that forward is processed.
+        with release_hold(self.tree_cache, req):
+            self.tree_cache.free_kv_row(
+                req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
+            )
+            unlock_after_held_frees(self.tree_cache, req.lock)
+            req.lock = None
+            kv_storage_of(
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+            ).release_row(req)
         req.kv.mark_kv_released()
         self.offloaded_state.pop(req, None)
 
